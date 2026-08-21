@@ -1,0 +1,130 @@
+diff --git a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c
+index 8f72701af5..26ca6e60e6 100644
+--- a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c
++++ b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c
+@@ -610,8 +610,23 @@ gst_gl_window_wayland_egl_open (GstGLWindow * window, GError ** error)
+     return FALSE;
+   }
+ 
+-  window_egl->wl_source = wayland_event_source_new (display->display,
+-      window_egl->window.queue);
++  /* A foreign display is owned (and its connection read) by whoever
++   * created it and handed it to us, e.g. Qt's Wayland platform plugin
++   * when this GstGLDisplay wraps its display for qmlglsink. We must not
++   * also try to read that connection ourselves: wayland_event_source_new()
++   * would compete with the owner for the connection's single, process-wide
++   * reader role, and losing that race for as long as the compositor stays
++   * quiet (e.g. paused video, or before the first frame arrives during
++   * preroll) starves the owner's own reads - observed live as multi-second
++   * to indefinite UI freezes. wayland_event_source_new_foreign() only
++   * drains our own queue, which the owner's reads keep filling regardless
++   * of who dispatches it. */
++  if (display->foreign_display)
++    window_egl->wl_source = wayland_event_source_new_foreign (display->display,
++        window_egl->window.queue);
++  else
++    window_egl->wl_source = wayland_event_source_new (display->display,
++        window_egl->window.queue);
+ 
+   if (!GST_GL_WINDOW_CLASS (parent_class)->open (window, error))
+     return FALSE;
+diff --git a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.c b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.c
+index 8e9a6848c2..bb3c35fe49 100644
+--- a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.c
++++ b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.c
+@@ -164,3 +164,83 @@ wayland_event_source_new (struct wl_display *display,
+ 
+   return &source->source;
+ }
++
++/* How often to drain our own queue when we can't rely on ever being the
++ * one whose poll() wakes up for it - see wayland_event_source_new_foreign()
++ * below. Matches a single frame at 60Hz; queued input/frame-callback
++ * events sit for at most this long before being dispatched. */
++#define WAYLAND_FOREIGN_DISPATCH_INTERVAL_MS 16
++
++typedef struct _WaylandForeignDispatchSource
++{
++  struct wl_display *display;
++  struct wl_event_queue *queue;
++} WaylandForeignDispatchSource;
++
++static gboolean
++wayland_foreign_dispatch_source_func (gpointer user_data)
++{
++  WaylandForeignDispatchSource *source = user_data;
++
++  /* This queue belongs to a wl_display we don't own (e.g. Qt's, shared
++   * with us via gst_gl_display_wayland_new_with_display()). The owning
++   * application already reads that connection on its own event loop, so
++   * whatever it read that was destined for our private queue is already
++   * sitting here, pending - dispatch_queue_pending() only walks our own
++   * already-received list and invokes callbacks, it never touches the
++   * socket or the connection's shared reader_count/mutex. We must never
++   * call wl_display_prepare_read()/read_events() ourselves on a foreign
++   * display: doing so - even briefly, even just to poll - competes with
++   * the owner for the same process-wide reader role, which is exactly
++   * what causes the freezes this replaces (see the removed timeout-bound
++   * mitigation this supersedes: bounding the wait only shrank the window
++   * of starvation, it couldn't remove the contention itself). */
++  wl_display_dispatch_queue_pending (source->display, source->queue);
++
++  /* Requests we've queued (e.g. a surface commit) still need to reach the
++   * compositor. flush() only writes already-queued outgoing data and
++   * doesn't participate in the reader-role protocol at all, so it's safe
++   * to call from here same as from any other thread sharing this
++   * connection. */
++  wl_display_flush (source->display);
++
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++wayland_foreign_dispatch_source_free (gpointer user_data)
++{
++  g_free (user_data);
++}
++
++/**
++ * wayland_event_source_new_foreign:
++ * @display: a #wl_display not owned by us
++ * @queue: our private #wl_event_queue on @display
++ *
++ * Like wayland_event_source_new(), but for a @display we don't own and
++ * must not compete with its owner to read. Only drains @queue - which
++ * the owner's own reads keep filling - on a periodic timer, never
++ * touching the shared reader role itself.
++ *
++ * Returns: (transfer full): a new #GSource
++ */
++GSource *
++wayland_event_source_new_foreign (struct wl_display *display,
++    struct wl_event_queue *queue)
++{
++  GSource *source;
++  WaylandForeignDispatchSource *data;
++
++  init_debug ();
++
++  data = g_new (WaylandForeignDispatchSource, 1);
++  data->display = display;
++  data->queue = queue;
++
++  source = g_timeout_source_new (WAYLAND_FOREIGN_DISPATCH_INTERVAL_MS);
++  g_source_set_callback (source, wayland_foreign_dispatch_source_func, data,
++      wayland_foreign_dispatch_source_free);
++
++  return source;
++}
+diff --git a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.h b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.h
+index 77bad1258e..e234d06227 100644
+--- a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.h
++++ b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.h
+@@ -36,4 +36,7 @@
+ GSource * wayland_event_source_new (struct wl_display *display,
+                                     struct wl_event_queue *queue);
+ 
++GSource * wayland_event_source_new_foreign (struct wl_display *display,
++                                    struct wl_event_queue *queue);
++
+ #endif /* __WAYLAND_EVENT_SOURCE_H__ */
