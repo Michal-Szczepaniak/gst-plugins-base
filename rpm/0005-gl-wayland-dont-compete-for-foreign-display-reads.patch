@@ -1,8 +1,46 @@
 diff --git a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c
-index 8f72701af5..26ca6e60e6 100644
+index 9883c2fa26..91fa9bdbb0 100644
 --- a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c
 +++ b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/gstglwindow_wayland_egl.c
-@@ -610,8 +610,23 @@ gst_gl_window_wayland_egl_open (GstGLWindow * window, GError ** error)
+@@ -345,8 +345,22 @@ create_surfaces (GstGLWindowWaylandEGL * window_egl)
+   gint width, height;
+ 
+   if (!window_egl->window.surface) {
++    GstGLWindow *window = GST_GL_WINDOW (window_egl);
++    GstGLDisplayWayland *display = GST_GL_DISPLAY_WAYLAND (window->display);
++
+     window_egl->window.surface =
+         wl_compositor_create_surface (window_egl->display.compositor);
++
++    /* We're about to own a real wl_surface on a foreign display for the
++     * first time - see the comment in gst_gl_window_wayland_egl_open()
++     * for why that source isn't already attached. Start draining our
++     * queue now that there's something (frame callbacks, xdg_wm_base
++     * pings) that will actually land in it and needs timely servicing. */
++    if (display->foreign_display && !window_egl->wl_source) {
++      window_egl->wl_source = wayland_event_source_new_foreign (
++          display->display, window_egl->window.queue);
++      g_source_attach (window_egl->wl_source, window->main_context);
++    }
+   }
+ 
+   if (window_egl->window.foreign_surface) {
+@@ -479,9 +493,11 @@ gst_gl_window_wayland_egl_close (GstGLWindow * gl_window)
+    * server, leaving the window visible and unrefreshed on screen. */
+   wl_display_flush (GST_GL_DISPLAY_WAYLAND (gl_window->display)->display);
+ 
+-  g_source_destroy (window_egl->wl_source);
+-  g_source_unref (window_egl->wl_source);
+-  window_egl->wl_source = NULL;
++  if (window_egl->wl_source) {
++    g_source_destroy (window_egl->wl_source);
++    g_source_unref (window_egl->wl_source);
++    window_egl->wl_source = NULL;
++  }
+ 
+   if (window_egl->display.registry)
+     wl_registry_destroy (window_egl->display.registry);
+@@ -610,13 +626,41 @@ gst_gl_window_wayland_egl_open (GstGLWindow * window, GError ** error)
      return FALSE;
    }
  
@@ -16,18 +54,37 @@ index 8f72701af5..26ca6e60e6 100644
 +   * reader role, and losing that race for as long as the compositor stays
 +   * quiet (e.g. paused video, or before the first frame arrives during
 +   * preroll) starves the owner's own reads - observed live as multi-second
-+   * to indefinite UI freezes. wayland_event_source_new_foreign() only
-+   * drains our own queue, which the owner's reads keep filling regardless
-+   * of who dispatches it. */
-+  if (display->foreign_display)
-+    window_egl->wl_source = wayland_event_source_new_foreign (display->display,
-+        window_egl->window.queue);
-+  else
++   * to indefinite UI freezes.
++   *
++   * For a foreign display we therefore never attach the regular reading
++   * source here. We also don't attach its replacement yet: nothing can
++   * land in our private queue beyond what the roundtrip above just
++   * synchronously drained until we actually own a wl_surface on this
++   * connection (frame callbacks, xdg_wm_base pings, etc. all require
++   * one), and create_window() - the only thing that ever creates one -
++   * is only reached with other_context == NULL in
++   * gst_gl_context_egl_create_context() (gstglcontext_egl.c). qmlglsink,
++   * the only real consumer of foreign displays, always creates its
++   * context via gst_qt_get_gl_wrapcontext() -> gst_gl_context_create()
++   * with a non-NULL other_context (the context it's wrapping), so that
++   * branch - and therefore any wl_surface on this display - never
++   * happens. create_surfaces() lazily attaches
++   * wayland_event_source_new_foreign() the moment - if ever - that
++   * stops being true, so the cost only exists for consumers that
++   * actually need it. */
++  if (!display->foreign_display)
 +    window_egl->wl_source = wayland_event_source_new (display->display,
 +        window_egl->window.queue);
  
    if (!GST_GL_WINDOW_CLASS (parent_class)->open (window, error))
      return FALSE;
+ 
+-  g_source_attach (window_egl->wl_source, window->main_context);
++  if (window_egl->wl_source)
++    g_source_attach (window_egl->wl_source, window->main_context);
+ 
+   return TRUE;
+ }
 diff --git a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.c b/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.c
 index 8e9a6848c2..bb3c35fe49 100644
 --- a/subprojects/gst-plugins-base/gst-libs/gst/gl/wayland/wayland_event_source.c
