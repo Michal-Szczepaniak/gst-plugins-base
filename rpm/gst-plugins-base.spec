@@ -11,8 +11,9 @@ Summary:	GStreamer streaming media framework base plug-ins
 License:	LGPLv2+
 URL:		https://github.com/sailfishos/gst-plugins-base
 Source:		%{name}-%{version}.tar.xz
-Patch0:     0004-fix-wayland-seat-version.patch
-Patch1:     0005-gl-wayland-dont-compete-for-foreign-display-reads.patch
+Patch0:		0001-gst-plugins-base-gl-wayland-Allow-lower-wl_seat-inte.patch
+Patch1:		0002-gl-basefilter-refresh-context-on-app-context-change.patch
+Patch2:     0005-gl-wayland-dont-compete-for-foreign-display-reads.patch
 
 %define sonamever %(echo %{version} | cut -d '+' -f 1)
 
